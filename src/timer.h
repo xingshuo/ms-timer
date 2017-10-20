@@ -54,6 +54,8 @@ typedef struct {
     size_t size;
     size_t capacity;
     void(*push)(void*, int, int, int);
+    void(*adjust)(void*, int, int, int);
+    void(*erase)(void*, int);
 } TimerBase;
 
 TimerBase* create_timer(size_t);

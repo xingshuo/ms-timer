@@ -4,6 +4,18 @@
 
 #define EARLY_THAN(x, y) CMP_TIME(&(x.deadline), &(y.deadline), <=)
 
+#define INIT_TIMER(p, session, msec, count)   \
+    do {              \
+        (p)->session = session;     \
+        GET_TIME(&(p)->deadline);     \
+        int tv_sec = msec/1000;      \
+        int tv_usec = (msec%1000)*1000;     \
+        struct timeval interval = {tv_sec, tv_usec};      \
+        ADD_TIME(&(p)->deadline, &interval, &(p)->deadline);  \
+        (p)->interval = interval;     \
+        (p)->count = (count > 0) ? count : -1;      \
+    }while (0)
+
 void
 downheap (Timer *heap, int N, int k)
 {
@@ -77,15 +89,37 @@ push_timer(void *arg, int session, int msec, int count) {
     memset(TI->data+old_cap+1, 0, old_cap*sizeof(Timer));
   }
   Timer *p = &TI->data[++TI->size];
-  p->session = session;
-  GET_TIME(&p->deadline);
-  int tv_sec = msec/1000;
-  int tv_usec = (msec%1000)*1000;
-  struct timeval interval = {tv_sec, tv_usec};
-  ADD_TIME(&p->deadline, &interval, &p->deadline);
-  p->interval = interval;
-  p->count = (count > 0) ? count : -1;
+  INIT_TIMER(p, session, msec, count);
   upheap(TI->data, TI->size);
+}
+
+static void
+adjust_timer(void *arg, int session, int msec, int count) {
+  TimerBase *TI = (TimerBase*)arg;
+  int i;
+  for (i = HEAP0; i <= TI->size; i++) {
+    if (session == TI->data[i].session) {
+      INIT_TIMER(&TI->data[i], session, msec, count);
+      adjustheap(TI->data, TI->size, i);
+      break;
+    }
+  }
+}
+
+static void
+erase_timer(void *arg, int session) {
+  TimerBase *TI = (TimerBase*)arg;
+  int i;
+  for (i = HEAP0; i <= TI->size; i++) {
+    if (session == TI->data[i].session) {
+      int nbytes = (TI->size - i) * sizeof(Timer);
+      if (nbytes > 0) {
+        memmove(&TI->data[i], &TI->data[i+1], nbytes);
+      }
+      TI->size--;
+      break;
+    }
+  }
 }
 
 TimerBase*
@@ -96,6 +130,8 @@ create_timer(size_t capacity) {
   TI->size = 0;
   TI->data = calloc(TI->capacity+1, sizeof(Timer));
   TI->push = push_timer;
+  TI->adjust = adjust_timer;
+  TI->erase = erase_timer;
   return TI;
 }
 

@@ -1,3 +1,7 @@
+/**
+ * author: xingshuo
+ * date: 2017-10-19
+ */
 #include "timer.h"
 
 #include <lua.h>
@@ -24,6 +28,11 @@ struct message {
     int count;
 };
 
+struct request_package {
+    uint8_t header[4]; //4 byte alignment
+    struct message msg;
+};
+
 struct timer_mgr {
     int send_fd;
     int recv_fd;
@@ -32,20 +41,40 @@ struct timer_mgr {
     TimerBase* timer_base;
 };
 
-
 static void
-block_send(int fd, const char * buffer, int sz) {
-    while(sz > 0) {
-        int r = send(fd, buffer, sz, 0);
-        if (r < 0) {
+block_write(int fd, char *buffer, int sz) {
+    while (sz > 0) {
+        int n = write(fd, buffer, sz);
+        if (n < 0) {
             if (errno == EAGAIN || errno == EINTR)
                 continue;
-            fprintf(stderr, "socket error: %s", strerror(errno));
-            break;
+            fprintf(stderr, "socket-server : write pipe error %s.\n",strerror(errno));
         }
-        buffer += r;
-        sz -= r;
+        buffer += n;
+        sz -= n;
     }
+}
+
+static void
+block_read(int fd, char *buffer, int sz) {
+    while (sz > 0) {
+        int n = read(fd, buffer, sz);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EINTR) //if only 2 threads use one socketpair, EAGAIN is ok
+                continue;
+            fprintf(stderr, "socket-server : read pipe error %s.\n",strerror(errno));
+            return;
+        }
+        buffer += n;
+        sz -= n;
+    }
+}
+
+static void
+send_request(struct timer_mgr *m, struct request_package *request, char type, int len) {
+    request->header[2] = (uint8_t)type;
+    request->header[3] = (uint8_t)len;
+    block_write(m->send_fd, (char*)&request->header[2], len+2);
 }
 
 static void *
@@ -63,7 +92,7 @@ base_loop(void *arg) {
         struct timeval tmp;
         int n = process_timer(tb, outbuffer, MAX_BUFFER_SIZE);
         if (n > 0) {
-            block_send(m->recv_fd, (char*)outbuffer, n*sizeof(int));
+            block_write(m->recv_fd, (char*)outbuffer, n*sizeof(int));
         }
         if (tb->size > 0) {
                GET_TIME(&cur_tv);
@@ -76,16 +105,34 @@ base_loop(void *arg) {
         FD_SET(m->recv_fd, &m->rfds);
         int retval = select(m->recv_fd+1, &m->rfds, NULL, NULL, timeout); //return 0 when timeout,1 when socket readable
         if (retval == 1) {
-            struct message msg;
-            int r = recv(m->recv_fd, (void*)&msg, sizeof(struct message), 0);
-            if (r == sizeof(struct message)) {
-                tb->push(tb, msg.session, msg.msec, msg.count);
-            }else if(r == 0) { //socket close
+            uint8_t header[2];
+            uint8_t buffer[256]; //larger than sizeof(struct request_package)
+            block_read(m->recv_fd, (char*)header, sizeof(header));
+            char type = header[0];
+            int len = header[1];
+            block_read(m->recv_fd, (char*)buffer, len);
+            struct message* msg;
+            switch (type) {
+            case 'A':
+                msg = (struct message *)buffer;
+                tb->push(tb, msg->session, msg->msec, msg->count);
+                break;
+            case 'U':
+                msg = (struct message *)buffer;
+                tb->adjust(tb, msg->session, msg->msec, msg->count);
+                break;
+            case 'D':
+                msg = (struct message *)buffer;
+                tb->erase(tb, msg->session);
+                break;
+            case 'X':
+                m->loop_break = 1;
                 break;
             }
         }
     }
     release_timer(m->timer_base);
+    close(m->send_fd);
     close(m->recv_fd);
     printf("[mstimer: %p] release\n", m);
     return NULL;
@@ -95,8 +142,8 @@ base_loop(void *arg) {
 static int
 _release(lua_State *L) {
     struct timer_mgr* m = GET_TIMER_MGR(L, 1);
-    m->loop_break = 1;
-    close(m->send_fd);
+    struct request_package request;
+    send_request(m, &request, 'X', 0);
     return 0;
 }
 
@@ -135,8 +182,38 @@ ladd(lua_State *L) {
     int session = luaL_checkinteger(L, 2);
     int msec = luaL_checkinteger(L, 3);
     int count = luaL_checkinteger(L, 4);
-    struct message msg = {session, msec, count};
-    block_send(m->send_fd, (char*)&msg, sizeof(msg));
+
+    struct request_package request;
+    request.msg.session = session;
+    request.msg.msec = msec;
+    request.msg.count = count;
+    send_request(m, &request, 'A', sizeof(request.msg));
+    return 0;
+}
+
+static int
+lupdate(lua_State *L) {
+    struct timer_mgr* m = GET_TIMER_MGR(L, 1);
+    int session = luaL_checkinteger(L, 2);
+    int msec = luaL_checkinteger(L, 3);
+    int count = luaL_checkinteger(L, 4);
+
+    struct request_package request;
+    request.msg.session = session;
+    request.msg.msec = msec;
+    request.msg.count = count;
+    send_request(m, &request, 'U', sizeof(request.msg));
+    return 0;
+}
+
+static int
+ldelete(lua_State *L) {
+    struct timer_mgr* m = GET_TIMER_MGR(L, 1);
+    int session = luaL_checkinteger(L, 2);
+
+    struct request_package request;
+    request.msg.session = session;
+    send_request(m, &request, 'D', sizeof(request.msg));
     return 0;
 }
 
@@ -144,7 +221,7 @@ static int
 lrecv(lua_State *L) {
     struct timer_mgr* m = GET_TIMER_MGR(L, 1);
     int buffer;
-    int r = recv(m->send_fd, &buffer, sizeof(buffer), 0);
+    int r = read(m->send_fd, &buffer, sizeof(buffer));
     if (r == 0) {
         lua_pushinteger(L, -1);
         // close
@@ -189,6 +266,8 @@ luaopen_mstimer(lua_State* L) {
 
     luaL_Reg timer_methods[] = {
         {"add", ladd},
+        {"update", lupdate},
+        {"delete", ldelete},
         {"recv", lrecv},
         {"sendfd", lsendfd},
         {NULL, NULL},
